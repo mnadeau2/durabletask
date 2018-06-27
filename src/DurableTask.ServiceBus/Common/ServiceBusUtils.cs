@@ -26,20 +26,22 @@ namespace DurableTask.ServiceBus.Common
     using DurableTask.Core.Tracing;
     using DurableTask.Core.Tracking;
     using DurableTask.ServiceBus.Settings;
-    using Microsoft.ServiceBus;
-    using Microsoft.ServiceBus.Messaging;
+    using Microsoft.Azure.ServiceBus;
     using Newtonsoft.Json;
+    using Microsoft.Azure.ServiceBus.Primitives;
+    using Microsoft.Azure.ServiceBus.Core;
+    using System.Text;
 
     internal static class ServiceBusUtils
     {
         static TimeSpan TokenTimeToLive = TimeSpan.FromDays(30);
 
-        public static Task<BrokeredMessage> GetBrokeredMessageFromObjectAsync(object serializableObject, CompressionSettings compressionSettings)
+        public static Task<Message> GetBrokeredMessageFromObjectAsync(object serializableObject, CompressionSettings compressionSettings)
         {
             return GetBrokeredMessageFromObjectAsync(serializableObject, compressionSettings, new ServiceBusMessageSettings(), null, null, null, DateTimeUtils.MinDateTime);
         }
 
-        public static async Task<BrokeredMessage> GetBrokeredMessageFromObjectAsync(
+        public static async Task<Message> GetBrokeredMessageFromObjectAsync(
             object serializableObject,
             CompressionSettings compressionSettings,
             ServiceBusMessageSettings messageSettings,
@@ -55,7 +57,8 @@ namespace DurableTask.ServiceBus.Common
 
             if (compressionSettings.Style == CompressionStyle.Legacy)
             {
-                return new BrokeredMessage(serializableObject) { SessionId = instance?.InstanceId };
+                var messageContent = JsonConvert.SerializeObject(serializableObject);
+                return new Message(System.Text.Encoding.UTF8.GetBytes(messageContent)) { SessionId = instance?.InstanceId }; // TODO: this might be a breaking change for non-net core version.
             }
 
             if (messageSettings == null)
@@ -70,7 +73,7 @@ namespace DurableTask.ServiceBus.Common
 
             try
             {
-                BrokeredMessage brokeredMessage = null;
+                Message brokeredMessage = null;
 
                 if (compressionSettings.Style == CompressionStyle.Always ||
                     (compressionSettings.Style == CompressionStyle.Threshold &&
@@ -124,15 +127,20 @@ namespace DurableTask.ServiceBus.Common
             }
         }
 
-        static BrokeredMessage GenerateBrokeredMessageWithCompressionTypeProperty(Stream stream, string compressionType)
+        static Message GenerateBrokeredMessageWithCompressionTypeProperty(Stream stream, string compressionType)
         {
-            BrokeredMessage brokeredMessage = new BrokeredMessage(stream, true);
-            brokeredMessage.Properties[FrameworkConstants.CompressionTypePropertyName] = compressionType;
+            stream.Position = 0;
+            byte[] buffer = new byte[stream.Length];
+            for (int totalBytesCopied = 0; totalBytesCopied < stream.Length;)
+                totalBytesCopied += stream.Read(buffer, totalBytesCopied, Convert.ToInt32(stream.Length) - totalBytesCopied);
+
+            Message brokeredMessage = new Message(buffer);
+            brokeredMessage.UserProperties[FrameworkConstants.CompressionTypePropertyName] = compressionType;
 
             return brokeredMessage;
         }
 
-        static async Task<BrokeredMessage> GenerateBrokeredMessageWithBlobKeyPropertyAsync(
+        static async Task<Message> GenerateBrokeredMessageWithBlobKeyPropertyAsync(
             Stream stream,
             IOrchestrationServiceBlobStore orchestrationServiceBlobStore,
             OrchestrationInstance instance,
@@ -166,14 +174,14 @@ namespace DurableTask.ServiceBus.Common
                 () => $"Saving the message stream in blob storage using key {blobKey}.");
             await orchestrationServiceBlobStore.SaveStreamAsync(blobKey, stream);
 
-            BrokeredMessage brokeredMessage = new BrokeredMessage();
-            brokeredMessage.Properties[ServiceBusConstants.MessageBlobKey] = blobKey;
-            brokeredMessage.Properties[FrameworkConstants.CompressionTypePropertyName] = compressionType;
+            Message brokeredMessage = new Message();
+            brokeredMessage.UserProperties[ServiceBusConstants.MessageBlobKey] = blobKey;
+            brokeredMessage.UserProperties[FrameworkConstants.CompressionTypePropertyName] = compressionType;
 
             return brokeredMessage;
         }
 
-        public static async Task<T> GetObjectFromBrokeredMessageAsync<T>(BrokeredMessage message, IOrchestrationServiceBlobStore orchestrationServiceBlobStore)
+        public static async Task<T> GetObjectFromBrokeredMessageAsync<T>(Message message, IOrchestrationServiceBlobStore orchestrationServiceBlobStore)
         {
             if (message == null)
             {
@@ -185,7 +193,7 @@ namespace DurableTask.ServiceBus.Common
             object compressionTypeObj = null;
             string compressionType = string.Empty;
 
-            if (message.Properties.TryGetValue(FrameworkConstants.CompressionTypePropertyName, out compressionTypeObj))
+            if (message.UserProperties.TryGetValue(FrameworkConstants.CompressionTypePropertyName, out compressionTypeObj))
             {
                 compressionType = (string)compressionTypeObj;
             }
@@ -193,7 +201,8 @@ namespace DurableTask.ServiceBus.Common
             if (string.IsNullOrEmpty(compressionType))
             {
                 // no compression, legacy style
-                deserializedObject = message.GetBody<T>();
+                var messageContent = Encoding.UTF8.GetString(message.Body);
+                deserializedObject = JsonConvert.DeserializeObject<T>(messageContent); // TODO: this might be a breaking change for non-net core version.
             }
             else if (string.Equals(compressionType, FrameworkConstants.CompressionTypeGzipPropertyValue,
                 StringComparison.OrdinalIgnoreCase))
@@ -262,12 +271,12 @@ namespace DurableTask.ServiceBus.Common
             }
         }
 
-        static Task<Stream> LoadMessageStreamAsync(BrokeredMessage message, IOrchestrationServiceBlobStore orchestrationServiceBlobStore)
+        static Task<Stream> LoadMessageStreamAsync(Message message, IOrchestrationServiceBlobStore orchestrationServiceBlobStore)
         {
             object blobKeyObj = null;
             string blobKey = string.Empty;
 
-            if (message.Properties.TryGetValue(ServiceBusConstants.MessageBlobKey, out blobKeyObj))
+            if (message.UserProperties.TryGetValue(ServiceBusConstants.MessageBlobKey, out blobKeyObj))
             {
                 blobKey = (string)blobKeyObj;
             }
@@ -276,7 +285,7 @@ namespace DurableTask.ServiceBus.Common
             {
                 // load the stream from the message directly if the blob key property is not set,
                 // i.e., it is not stored externally
-                return Task.Run(() => message.GetBody<Stream>());
+                return Task.FromResult((Stream)new MemoryStream(message.Body));
             }
 
             // if the blob key is set in the message property,
@@ -289,30 +298,30 @@ namespace DurableTask.ServiceBus.Common
             return orchestrationServiceBlobStore.LoadStreamAsync(blobKey);
         }
 
-        public static void CheckAndLogDeliveryCount(string sessionId, IEnumerable<BrokeredMessage> messages, int maxDeliverycount)
+        public static void CheckAndLogDeliveryCount(string sessionId, IEnumerable<Message> messages, int maxDeliverycount)
         {
-            foreach (BrokeredMessage message in messages)
+            foreach (Message message in messages)
             {
                 CheckAndLogDeliveryCount(sessionId, message, maxDeliverycount);
             }
         }
 
-        public static void CheckAndLogDeliveryCount(IEnumerable<BrokeredMessage> messages, int maxDeliverycount)
+        public static void CheckAndLogDeliveryCount(IEnumerable<Message> messages, int maxDeliverycount)
         {
-            foreach (BrokeredMessage message in messages)
+            foreach (Message message in messages)
             {
                 CheckAndLogDeliveryCount(message, maxDeliverycount);
             }
         }
 
-        public static void CheckAndLogDeliveryCount(BrokeredMessage message, int maxDeliverycount)
+        public static void CheckAndLogDeliveryCount(Message message, int maxDeliverycount)
         {
             CheckAndLogDeliveryCount(null, message, maxDeliverycount);
         }
 
-        public static void CheckAndLogDeliveryCount(string sessionId, BrokeredMessage message, int maxDeliveryCount)
+        public static void CheckAndLogDeliveryCount(string sessionId, Message message, int maxDeliveryCount)
         {
-            if (message.DeliveryCount >= maxDeliveryCount - 2)
+            if (message.SystemProperties.DeliveryCount >= maxDeliveryCount - 2)
             {
                 if (!string.IsNullOrEmpty(sessionId))
                 {
@@ -322,7 +331,7 @@ namespace DurableTask.ServiceBus.Common
                         sessionId,
                         "Delivery count for message with id {0} is {1}. Message will be deadlettered if processing continues to fail.",
                         message.MessageId,
-                        message.DeliveryCount);
+                        message.SystemProperties.DeliveryCount);
                 }
                 else
                 {
@@ -331,87 +340,27 @@ namespace DurableTask.ServiceBus.Common
                         "MaxDeliveryCountApproaching",
                         "Delivery count for message with id {0} is {1}. Message will be deadlettered if processing continues to fail.",
                         message.MessageId, 
-                        message.DeliveryCount);
+                        message.SystemProperties.DeliveryCount);
                 }
             }
         }
 
-        public static MessagingFactory CreateMessagingFactory(string connectionString)
+
+        public static MessageSender CreateMessageSender(ServiceBusConnectionStringBuilder sbcstringbuilder, string transferDestinationEntityPath, string viaEntityPath)
         {
-            MessagingFactory factory = MessagingFactory.CreateFromConnectionString(connectionString);
-            factory.RetryPolicy = RetryPolicy.Default;
-
-            TraceHelper.Trace(
-                TraceEventType.Information,
-                "CreateMessagingFactory",
-                "Initialized messaging factory with address {0}",
-                factory.Address);
-
-            return factory;
+            sbcstringbuilder.EntityPath = transferDestinationEntityPath;
+            return new MessageSender(sbcstringbuilder);
         }
 
-        public static MessagingFactory CreateSenderMessagingFactory(
-            NamespaceManager namespaceManager, ServiceBusConnectionStringBuilder sbConnectionStringBuilder, string entityPath, ServiceBusMessageSenderSettings messageSenderSettings)
+        public static MessageSender CreateMessageSender(ServiceBusConnectionStringBuilder sbcstringbuilder, string entityPath)
         {
-            MessagingFactory messagingFactory = MessagingFactory.Create(
-                namespaceManager.Address.ToString(),
-                new MessagingFactorySettings
-                {
-                    TransportType = TransportType.NetMessaging,
-                    TokenProvider = TokenProvider.CreateSharedAccessSignatureTokenProvider(
-                        sbConnectionStringBuilder.SharedAccessKeyName, 
-                        sbConnectionStringBuilder.SharedAccessKey, 
-                        TokenTimeToLive),
-                    NetMessagingTransportSettings = new NetMessagingTransportSettings()
-                    {
-                        BatchFlushInterval = TimeSpan.FromMilliseconds(messageSenderSettings.BatchFlushIntervalInMilliSecs)
-                    }
-                });
-
-            TraceHelper.Trace(
-                TraceEventType.Information,
-                "CreateSenderMessagingFactory",
-                "Initialized messaging factory with address {0}",
-                messagingFactory.Address);
-
-            return messagingFactory;
+            sbcstringbuilder.EntityPath = entityPath;
+            return new MessageSender(sbcstringbuilder);
         }
 
-        public static MessagingFactory CreateReceiverMessagingFactory(NamespaceManager namespaceManager, ServiceBusConnectionStringBuilder sbConnectionStringBuilder, string entityPath)
+        public static QueueClient CreateQueueClient(ServiceBusConnectionStringBuilder sbcstringbuilder, string entityPath)
         {
-            MessagingFactory messagingFactory = MessagingFactory.Create(
-                namespaceManager.Address.ToString(),
-                new MessagingFactorySettings
-                {
-                    TransportType = TransportType.NetMessaging,
-                    TokenProvider = TokenProvider.CreateSharedAccessSignatureTokenProvider(
-                        sbConnectionStringBuilder.SharedAccessKeyName, 
-                        sbConnectionStringBuilder.SharedAccessKey, 
-                        TokenTimeToLive)
-                });
-
-            TraceHelper.Trace(
-                TraceEventType.Information,
-                "CreateReceiverMessagingFactory",
-                "Initialized messaging factory with address {0}",
-                messagingFactory.Address);
-
-            return messagingFactory;
-        }
-
-        public static MessageSender CreateMessageSender(MessagingFactory senderFactory, string transferDestinationEntityPath, string viaEntityPath)
-        {
-            return senderFactory.CreateMessageSender(transferDestinationEntityPath, viaEntityPath);
-        }
-
-        public static MessageSender CreateMessageSender(MessagingFactory senderFactory, string entityPath)
-        {
-            return senderFactory.CreateMessageSender(entityPath);
-        }
-
-        public static QueueClient CreateQueueClient(MessagingFactory queueClientFactory, string entityPath)
-        {
-            return queueClientFactory.CreateQueueClient(entityPath);
+            return new QueueClient(sbcstringbuilder);
         }
     }
 }

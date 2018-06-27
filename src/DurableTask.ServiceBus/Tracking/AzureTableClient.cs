@@ -342,9 +342,9 @@ namespace DurableTask.ServiceBus.Tracking
         DateTime ClipStartTime(DateTime startTime)
         {
             DateTimeOffset offsetStartTime = startTime;
-            if (offsetStartTime < TableConstants.MinDateTime)
+            if (offsetStartTime < DateTimeOffset.MinValue)
             {
-                startTime = TableConstants.MinDateTime.DateTime;
+                startTime = DateTimeOffset.MinValue.DateTime;
             }
             return startTime;
         }

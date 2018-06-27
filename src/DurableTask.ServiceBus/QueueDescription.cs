@@ -11,17 +11,24 @@
 //  limitations under the License.
 //  ----------------------------------------------------------------------------------
 
+using System;
+
 namespace DurableTask.ServiceBus
 {
-    using System;
-    using System.Collections.Generic;
-    using DurableTask.Core;
-    using Microsoft.Azure.ServiceBus;
-
-    class ServiceBusOrchestrationSession
+    internal class QueueDescription
     {
-        public IMessageSession Session;
-        public Dictionary<string, Message> LockTokens;
-        public long SequenceNumber;
+        private string path;
+
+        public QueueDescription(string path)
+        {
+            this.path = path;
+        }
+
+        public bool RequiresSession { get; set; }
+        public int MaxDeliveryCount { get; set; }
+        public bool RequiresDuplicateDetection { get; set; }
+        public TimeSpan DuplicateDetectionHistoryTimeWindow { get; set; }
+        public long MaxSizeInMegabytes { get; set; }
+        public object Path { get; internal set; }
     }
 }
